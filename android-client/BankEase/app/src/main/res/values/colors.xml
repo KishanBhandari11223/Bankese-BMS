@@ -2,4 +2,8 @@
 <resources>
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
+    <color name="sidebar_blue">#FF1266D5</color>
+    <color name="sidebar_blue_selected">#FF0E55B2</color>
+    <color name="sidebar_blue_pressed">#FF0B4A99</color>
+    <color name="sidebar_blue_disabled">#FF315D91</color>
 </resources>

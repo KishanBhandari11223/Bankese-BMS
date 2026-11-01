@@ -74,39 +74,39 @@
 
         <Button
             android:id="@+id/navDashboard"
+            style="@style/Widget.BankEase.SidebarButton"
             android:layout_width="match_parent"
             android:layout_height="52dp"
             android:gravity="start|center_vertical"
             android:text="Home"
-            android:textAllCaps="false"
-            android:textColor="#1266D5" />
+            android:textAllCaps="false" />
 
         <Button
             android:id="@+id/navAccounts"
+            style="@style/Widget.BankEase.SidebarButton"
             android:layout_width="match_parent"
             android:layout_height="52dp"
             android:gravity="start|center_vertical"
             android:text="Accounts"
-            android:textAllCaps="false"
-            android:textColor="#1266D5" />
+            android:textAllCaps="false" />
 
         <Button
             android:id="@+id/navHistory"
+            style="@style/Widget.BankEase.SidebarButton"
             android:layout_width="match_parent"
             android:layout_height="52dp"
             android:gravity="start|center_vertical"
             android:text="Activity"
-            android:textAllCaps="false"
-            android:textColor="#1266D5" />
+            android:textAllCaps="false" />
 
         <Button
             android:id="@+id/navProfile"
+            style="@style/Widget.BankEase.SidebarButton"
             android:layout_width="match_parent"
             android:layout_height="52dp"
             android:gravity="start|center_vertical"
             android:text="Profile"
-            android:textAllCaps="false"
-            android:textColor="#1266D5" />
+            android:textAllCaps="false" />
 
         <Space
             android:layout_width="match_parent"
@@ -121,12 +121,11 @@
 
         <Button
             android:id="@+id/navSignOut"
+            style="@style/Widget.BankEase.SidebarButton"
             android:layout_width="match_parent"
             android:layout_height="52dp"
-            android:backgroundTint="#FFF1F0"
             android:gravity="start|center_vertical"
             android:text="Sign out"
-            android:textAllCaps="false"
-            android:textColor="#B42318" />
+            android:textAllCaps="false" />
     </LinearLayout>
 </androidx.drawerlayout.widget.DrawerLayout>

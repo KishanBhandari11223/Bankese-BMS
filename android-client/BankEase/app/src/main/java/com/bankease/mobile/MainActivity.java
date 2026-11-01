@@ -1,7 +1,14 @@
 package com.bankease.mobile;
 
+import android.Manifest;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.content.Intent;
+import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.graphics.Color;
+import android.os.Build;
 import android.os.Bundle;
 import android.text.InputType;
 import android.view.LayoutInflater;
@@ -23,7 +30,13 @@ import androidx.core.graphics.Insets;
 import androidx.core.view.ViewCompat;
 import androidx.core.view.WindowCompat;
 import androidx.core.view.WindowInsetsCompat;
+import androidx.core.app.NotificationCompat;
+import androidx.core.app.NotificationManagerCompat;
+import androidx.core.content.ContextCompat;
 import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.Set;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -32,6 +45,11 @@ public class MainActivity extends AppCompatActivity {
     private static final int BLUE = 0xFF1266D5;
     private static final int INK = 0xFF102344;
     private static final int MUTED = 0xFF64748B;
+    private static final String MONEY_CHANNEL_ID = "money_activity";
+    private static final String ACTION_OPEN_RECEIPT =
+            "com.bankease.mobile.action.OPEN_TRANSACTION_RECEIPT";
+    private static final String EXTRA_TRANSACTION_REFERENCE = "transaction_reference";
+    private static final String EXTRA_TRANSACTION_TYPE = "transaction_type";
 
     private TokenStore tokenStore;
     private ApiClient api;
@@ -41,13 +59,19 @@ public class MainActivity extends AppCompatActivity {
     private JSONArray accounts = new JSONArray();
     private JSONArray transactions = new JSONArray();
     private JSONObject profile = new JSONObject();
+    private JSONObject currentReceipt;
     private String currentScreen = "dashboard";
+    private String receiptReturnScreen = "dashboard";
     private long selectedAccountId = -1;
     private long totalTransactionCount;
     private boolean dataLoaded;
     private boolean moneyOperationInProgress;
     private boolean transferInProgress;
     private boolean recipientMutationInProgress;
+    private boolean appPaused;
+    private boolean historyRefreshInProgress;
+    private String pendingReceiptReference;
+    private String pendingReceiptType;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -58,6 +82,7 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
         api = new ApiClient(this, tokenStore);
+        createMoneyNotificationChannel();
         setContentView(R.layout.activity_main);
         applySystemBarInsets();
         drawerLayout = findViewById(R.id.mainDrawer);
@@ -78,6 +103,8 @@ public class MainActivity extends AppCompatActivity {
                     toast("Transaction is processing. Please wait.");
                 } else if (drawerLayout.isDrawerOpen(GravityCompat.START)) {
                     drawerLayout.closeDrawer(GravityCompat.START);
+                } else if (currentScreen.equals("receipt")) {
+                    returnFromReceipt();
                 } else if (!currentScreen.equals("dashboard")) {
                     showDashboard();
                 } else {
@@ -88,6 +115,32 @@ public class MainActivity extends AppCompatActivity {
         });
         showDashboard();
         loadBankingData();
+        requestNotificationPermissionIfNeeded();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (appPaused && dataLoaded) {
+            refreshTransactionHistory();
+        }
+        appPaused = false;
+    }
+
+    @Override
+    protected void onPause() {
+        appPaused = true;
+        super.onPause();
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        captureReceiptIntent(intent);
+        if (dataLoaded) {
+            openPendingReceipt();
+        }
     }
 
     private void navigateFromDrawer(String destination) {
@@ -172,6 +225,7 @@ public class MainActivity extends AppCompatActivity {
                         }
                         totalTransactionCount = history.optLong(
                                 "totalElements", transactions.length());
+                        processIncomingTransfers(transactions);
                         JSONObject selectedAccount = findAccount(selectedAccountId);
                         if (!isActive(selectedAccount)) {
                             selectedAccountId = firstActiveAccountId();
@@ -182,6 +236,8 @@ public class MainActivity extends AppCompatActivity {
                             && !currentScreen.equals("balance"))) {
                             refreshCurrentScreen();
                         }
+                        captureReceiptIntent(getIntent());
+                        openPendingReceipt();
                     }
 
                     @Override
@@ -194,6 +250,246 @@ public class MainActivity extends AppCompatActivity {
                         Toast.makeText(MainActivity.this, message, Toast.LENGTH_LONG).show();
                     }
                 });
+    }
+
+    private void createMoneyNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationChannel channel = new NotificationChannel(
+                    MONEY_CHANNEL_ID, "Money activity",
+                    NotificationManager.IMPORTANCE_DEFAULT);
+            channel.setDescription("Notifications for completed banking transactions");
+            NotificationManager manager = getSystemService(NotificationManager.class);
+            manager.createNotificationChannel(channel);
+        }
+    }
+
+    private void requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                && ContextCompat.checkSelfPermission(this,
+                        Manifest.permission.POST_NOTIFICATIONS)
+                        != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1001);
+        }
+    }
+
+    private void refreshTransactionHistory() {
+        if (historyRefreshInProgress) {
+            return;
+        }
+        historyRefreshInProgress = true;
+        api.execute(() -> api.transactions(0, 50),
+                new ApiClient.Callback<JSONObject>() {
+                    @Override
+                    public void onSuccess(JSONObject history) {
+                        historyRefreshInProgress = false;
+                        JSONArray latest = history.optJSONArray("transactions");
+                        transactions = latest == null ? new JSONArray() : latest;
+                        totalTransactionCount = history.optLong(
+                                "totalElements", transactions.length());
+                        processIncomingTransfers(transactions);
+                        if (currentScreen.equals("history")) {
+                            showHistory();
+                        } else if (currentScreen.equals("dashboard")) {
+                            showDashboard();
+                        }
+                        openPendingReceipt();
+                    }
+
+                    @Override
+                    public void onFailure(String message) {
+                        historyRefreshInProgress = false;
+                        if (isUnauthorized(message)) {
+                            tokenStore.clearToken();
+                            openLogin();
+                        } else {
+                            Toast.makeText(MainActivity.this, message,
+                                    Toast.LENGTH_LONG).show();
+                        }
+                    }
+                });
+    }
+
+    private void processIncomingTransfers(JSONArray records) {
+        SharedPreferences preferences = getSharedPreferences(
+                "money_activity_notifications", MODE_PRIVATE);
+        String customerKey = profile.optString("userId",
+                profile.optString("username", "customer"));
+        String baselineKey = "incoming_baseline_" + customerKey;
+        String seenKey = "incoming_seen_" + customerKey;
+        Set<String> seen = new HashSet<>(
+                preferences.getStringSet(seenKey, new HashSet<>()));
+        if (!preferences.getBoolean(baselineKey, false)) {
+            for (int i = 0; i < records.length(); i++) {
+                JSONObject transaction = records.optJSONObject(i);
+                if (transaction != null
+                        && "TRANSFER_IN".equals(transaction.optString("type"))) {
+                    seen.add(transactionDeduplicationKey(transaction));
+                }
+            }
+            preferences.edit()
+                    .putStringSet(seenKey, seen)
+                    .putBoolean(baselineKey, true)
+                    .apply();
+            return;
+        }
+
+        boolean changed = false;
+        for (int i = 0; i < records.length(); i++) {
+            JSONObject transaction = records.optJSONObject(i);
+            if (transaction == null
+                    || !"TRANSFER_IN".equals(transaction.optString("type"))) {
+                continue;
+            }
+            String key = transactionDeduplicationKey(transaction);
+            if (seen.contains(key)
+                    || !"COMPLETED".equals(transaction.optString("status"))) {
+                continue;
+            }
+            seen.add(key);
+            changed = true;
+            postMoneyNotification(transaction.optString("referenceNumber", ""),
+                    transaction.optString("type", ""),
+                    transaction.optString("amount", ""));
+        }
+        if (changed) {
+            preferences.edit().putStringSet(seenKey, seen).apply();
+        }
+    }
+
+    private String transactionDeduplicationKey(JSONObject transaction) {
+        long id = transaction.optLong("id", -1);
+        if (id > 0) {
+            return "id:" + id;
+        }
+        String reference = transaction.optString("referenceNumber", "");
+        return "ref:" + reference;
+    }
+
+    private void postMoneyNotification(String reference, String type, String amount) {
+        if (reference.isEmpty() || amount.isEmpty()
+                || !NotificationManagerCompat.from(this).areNotificationsEnabled()
+                || (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                && ContextCompat.checkSelfPermission(this,
+                        Manifest.permission.POST_NOTIFICATIONS)
+                        != PackageManager.PERMISSION_GRANTED)) {
+            return;
+        }
+
+        String title;
+        String text;
+        switch (type) {
+            case "DEPOSIT":
+                title = "Deposit completed";
+                text = "INR " + amount + " deposited";
+                break;
+            case "WITHDRAWAL":
+                title = "Withdrawal completed";
+                text = "INR " + amount + " withdrawn";
+                break;
+            case "TRANSFER_OUT":
+                title = "Transfer completed";
+                text = "INR " + amount + " sent";
+                break;
+            case "TRANSFER_IN":
+                title = "Transfer received";
+                text = "INR " + amount + " received";
+                break;
+            default:
+                return;
+        }
+
+        Intent receiptIntent = new Intent(this, MainActivity.class);
+        receiptIntent.setAction(ACTION_OPEN_RECEIPT);
+        receiptIntent.putExtra(EXTRA_TRANSACTION_REFERENCE, reference);
+        receiptIntent.putExtra(EXTRA_TRANSACTION_TYPE, type);
+        receiptIntent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP
+                | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        PendingIntent pendingIntent = PendingIntent.getActivity(
+                this, reference.hashCode(), receiptIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        NotificationCompat.Builder notification = new NotificationCompat.Builder(
+                this, MONEY_CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .setContentTitle(title)
+                .setContentText(text)
+                .setStyle(new NotificationCompat.BigTextStyle().bigText(text))
+                .setContentIntent(pendingIntent)
+                .setAutoCancel(true)
+                .setPriority(NotificationCompat.PRIORITY_DEFAULT);
+        try {
+            NotificationManagerCompat.from(this).notify(
+                    reference.hashCode(), notification.build());
+        } catch (SecurityException ignored) {
+            // Permission may be revoked between checking and posting.
+        }
+    }
+
+    private void captureReceiptIntent(Intent intent) {
+        if (intent != null && ACTION_OPEN_RECEIPT.equals(intent.getAction())) {
+            pendingReceiptReference = intent.getStringExtra(EXTRA_TRANSACTION_REFERENCE);
+            pendingReceiptType = intent.getStringExtra(EXTRA_TRANSACTION_TYPE);
+        }
+    }
+
+    private void openPendingReceipt() {
+        if (pendingReceiptReference == null || pendingReceiptReference.isEmpty()) {
+            return;
+        }
+        String reference = pendingReceiptReference;
+        String expectedType = pendingReceiptType;
+        pendingReceiptReference = null;
+        pendingReceiptType = null;
+        JSONObject transaction = findTransaction(reference, expectedType, transactions);
+        if (transaction != null) {
+            showReceipt(transaction, "dashboard");
+            return;
+        }
+        api.execute(() -> api.transactions(0, 50),
+                new ApiClient.Callback<JSONObject>() {
+                    @Override
+                    public void onSuccess(JSONObject history) {
+                        JSONArray records = history.optJSONArray("transactions");
+                        JSONObject match = findTransaction(reference, expectedType, records);
+                        if (match != null) {
+                            showReceipt(match, "dashboard");
+                        } else {
+                            showHistory();
+                            toast("This transaction receipt is no longer available.");
+                        }
+                    }
+
+                    @Override
+                    public void onFailure(String message) {
+                        if (isUnauthorized(message)) {
+                            tokenStore.clearToken();
+                            openLogin();
+                        } else {
+                            showHistory();
+                            toast("This transaction receipt is unavailable.");
+                        }
+                    }
+                });
+    }
+
+    private JSONObject findTransaction(
+            String reference, String expectedType, JSONArray records) {
+        if (records == null) {
+            return null;
+        }
+        JSONObject referenceMatch = null;
+        for (int i = 0; i < records.length(); i++) {
+            JSONObject transaction = records.optJSONObject(i);
+            if (transaction == null || !reference.equals(
+                    transaction.optString("referenceNumber", ""))) {
+                continue;
+            }
+            if (expectedType == null || expectedType.isEmpty()
+                    || expectedType.equals(transaction.optString("type"))) {
+                return transaction;
+            }
+            referenceMatch = transaction;
+        }
+        return referenceMatch;
     }
 
     private void refreshCurrentScreen() {
@@ -218,6 +514,13 @@ public class MainActivity extends AppCompatActivity {
                 break;
             case "balance":
                 showBalance(selectedAccountId);
+                break;
+            case "receipt":
+                if (currentReceipt != null) {
+                    showReceipt(currentReceipt, receiptReturnScreen);
+                } else {
+                    showDashboard();
+                }
                 break;
             default:
                 showDashboard();
@@ -290,6 +593,183 @@ public class MainActivity extends AppCompatActivity {
         } else {
             addTransactions(list, transactions.length());
         }
+    }
+
+    private void showReceipt(JSONObject transaction, String returnScreen) {
+        currentScreen = "receipt";
+        currentReceipt = transaction;
+        receiptReturnScreen = returnScreen;
+        inflate(R.layout.fragment_transaction_receipt);
+
+        LinearLayout details = screen.findViewById(R.id.receiptDetails);
+        ArrayList<String> shareLines = new ArrayList<>();
+        addReceiptDetail(details, shareLines, "Transaction reference",
+                receiptValue(transaction, "referenceNumber"));
+        String type = transaction.optString("type", "");
+        addReceiptDetail(details, shareLines, "Type", transactionTypeLabel(type));
+        addReceiptDetail(details, shareLines, "Amount",
+                receiptAmountValue(transaction));
+        addReceiptDetail(details, shareLines, "Date and time",
+                formatReceiptDate(transaction.optString("createdAt", "")));
+        addReceiptDetail(details, shareLines, "Status",
+                receiptValue(transaction, "status"));
+
+        String accountNumber = transaction.optString("accountNumber", "");
+        String relatedAccountNumber = transaction.optString("relatedAccountNumber", "");
+        if ("TRANSFER_OUT".equals(type)) {
+            addReceiptDetail(details, shareLines, "From account",
+                    receiptAccountValue(transaction, accountNumber));
+            addReceiptDetail(details, shareLines, "Recipient",
+                    receiptAccountValue(null, relatedAccountNumber));
+        } else if ("TRANSFER_IN".equals(type)) {
+            addReceiptDetail(details, shareLines, "To account",
+                    receiptAccountValue(transaction, accountNumber));
+            addReceiptDetail(details, shareLines, "Sender",
+                    receiptAccountValue(null, relatedAccountNumber));
+        } else {
+            addReceiptDetail(details, shareLines, "Account",
+                    receiptAccountValue(transaction, accountNumber));
+            if (!relatedAccountNumber.isEmpty()) {
+                addReceiptDetail(details, shareLines, "Related account",
+                        receiptAccountValue(null, relatedAccountNumber));
+            }
+        }
+
+        String description = transaction.optString("description", "");
+        if (!description.trim().isEmpty() && !"null".equals(description)) {
+            addReceiptDetail(details, shareLines, "Description", description);
+        }
+        String balanceAfter = transaction.optString("balanceAfter", "");
+        if (!balanceAfter.isEmpty() && !"null".equals(balanceAfter)) {
+            addReceiptDetail(details, shareLines, "Balance after",
+                    balanceAfter);
+        }
+        screen.findViewById(R.id.btnShareReceipt).setOnClickListener(view -> {
+            Intent share = new Intent(Intent.ACTION_SEND);
+            share.setType("text/plain");
+            share.putExtra(Intent.EXTRA_SUBJECT, "BankEase transaction receipt");
+            share.putExtra(Intent.EXTRA_TEXT, "BankEase transaction receipt\n\n"
+                    + joinLines(shareLines));
+            startActivity(Intent.createChooser(share, "Share receipt"));
+        });
+    }
+
+    private void returnFromReceipt() {
+        if ("history".equals(receiptReturnScreen)) {
+            showHistory();
+        } else {
+            showDashboard();
+        }
+    }
+
+    private void addReceiptDetail(
+            LinearLayout parent, ArrayList<String> shareLines, String label, String value) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.VERTICAL);
+        row.setPadding(dp(14), dp(12), dp(14), dp(12));
+        row.setBackgroundColor(Color.WHITE);
+
+        TextView labelView = new TextView(this);
+        labelView.setText(label);
+        labelView.setTextColor(MUTED);
+        labelView.setTextSize(12);
+        row.addView(labelView);
+
+        TextView valueView = new TextView(this);
+        valueView.setText(value);
+        valueView.setTextColor(INK);
+        valueView.setTextSize(16);
+        valueView.setTypeface(null, android.graphics.Typeface.BOLD);
+        valueView.setPadding(0, dp(4), 0, 0);
+        row.addView(valueView);
+
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        params.topMargin = dp(8);
+        parent.addView(row, params);
+        shareLines.add(label + ": " + value);
+    }
+
+    private String receiptValue(JSONObject transaction, String key) {
+        String value = transaction.optString(key, "");
+        return value.isEmpty() || "null".equals(value) ? "Unavailable" : value;
+    }
+
+    private String maskedAccountValue(String accountNumber) {
+        return accountNumber == null || accountNumber.isEmpty()
+                || "null".equals(accountNumber)
+                ? "Unavailable" : maskAccountNumber(accountNumber);
+    }
+
+    private String receiptAccountValue(JSONObject transaction, String accountNumber) {
+        String maskedNumber = maskedAccountValue(accountNumber);
+        JSONObject account = transaction == null ? null
+                : findAccount(transaction.optLong("accountId", -1));
+        if (account == null) {
+            account = findAccountByNumber(accountNumber);
+        }
+        String accountType = account == null ? "" : account.optString("accountType", "");
+        return accountType.isEmpty() || "null".equals(accountType)
+                ? maskedNumber : accountType + " · " + maskedNumber;
+    }
+
+    private String receiptAmountValue(JSONObject transaction) {
+        String amount = receiptValue(transaction, "amount");
+        long accountId = transaction.optLong("accountId", -1);
+        JSONObject account = findAccount(accountId);
+        if (account == null) {
+            account = findAccountByNumber(transaction.optString("accountNumber", ""));
+        }
+        String currency = account == null ? "" : account.optString("currency", "");
+        return currency.isEmpty() || "null".equals(currency)
+                ? amount : currency + " " + amount;
+    }
+
+    private JSONObject findAccountByNumber(String accountNumber) {
+        if (accountNumber == null || accountNumber.isEmpty()
+                || "null".equals(accountNumber)) {
+            return null;
+        }
+        for (int i = 0; i < accounts.length(); i++) {
+            JSONObject account = accounts.optJSONObject(i);
+            if (account != null && accountNumber.equals(
+                    account.optString("accountNumber", ""))) {
+                return account;
+            }
+        }
+        return null;
+    }
+
+    private String transactionTypeLabel(String type) {
+        switch (type) {
+            case "DEPOSIT":
+                return "Deposit";
+            case "WITHDRAWAL":
+                return "Withdrawal";
+            case "TRANSFER_OUT":
+                return "Transfer sent";
+            case "TRANSFER_IN":
+                return "Transfer received";
+            default:
+                return type.isEmpty() ? "Unavailable" : type.replace('_', ' ');
+        }
+    }
+
+    private String formatReceiptDate(String createdAt) {
+        return createdAt == null || createdAt.isEmpty() || "null".equals(createdAt)
+                ? "Unavailable" : createdAt.replace('T', ' ');
+    }
+
+    private String joinLines(ArrayList<String> lines) {
+        StringBuilder text = new StringBuilder();
+        for (String line : lines) {
+            if (text.length() > 0) {
+                text.append('\n');
+            }
+            text.append(line);
+        }
+        return text.toString();
     }
 
     private void showProfile() {
@@ -449,8 +929,15 @@ public class MainActivity extends AppCompatActivity {
                     @Override
                     public void onSuccess(JSONObject response) {
                         transferInProgress = false;
+                        if ("COMPLETED".equals(response.optString("status"))) {
+                            postMoneyNotification(
+                                    response.optString("referenceNumber", ""),
+                                    "TRANSFER_OUT", response.optString("amount", ""));
+                        }
+                        JSONObject fallbackReceipt = transferReceiptFromResponse(response);
+                        showReceipt(fallbackReceipt, "dashboard");
+                        loadTransferReceiptDetails(response, fallbackReceipt);
                         toast("Transfer completed and recorded.");
-                        showDashboard();
                         loadBankingData();
                     }
 
@@ -763,9 +1250,16 @@ public class MainActivity extends AppCompatActivity {
                     public void onSuccess(JSONObject response) {
                         transferInProgress = false;
                         dialog.dismiss();
+                        if ("COMPLETED".equals(response.optString("status"))) {
+                            postMoneyNotification(
+                                    response.optString("referenceNumber", ""),
+                                    "TRANSFER_OUT", response.optString("amount", ""));
+                        }
+                        JSONObject fallbackReceipt = transferReceiptFromResponse(response);
+                        showReceipt(fallbackReceipt, "dashboard");
+                        loadTransferReceiptDetails(response, fallbackReceipt);
                         toast("Transfer to friend completed and recorded.");
                         loadBankingData();
-                        loadSavedRecipients(screen);
                     }
 
                     @Override
@@ -781,6 +1275,67 @@ public class MainActivity extends AppCompatActivity {
 
     private String maskAccountNumber(String accountNumber) {
         return "•••• " + lastFour(accountNumber);
+    }
+
+    private JSONObject transferReceiptFromResponse(JSONObject response) {
+        JSONObject receipt = new JSONObject();
+        try {
+            receipt.put("referenceNumber", response.opt("referenceNumber"));
+            receipt.put("type", "TRANSFER_OUT");
+            receipt.put("amount", response.opt("amount"));
+            receipt.put("status", response.opt("status"));
+            receipt.put("accountNumber", response.opt("sourceAccountNumber"));
+            receipt.put("relatedAccountNumber",
+                    response.opt("destinationAccountNumber"));
+            receipt.put("createdAt", JSONObject.NULL);
+            receipt.put("description", JSONObject.NULL);
+            receipt.put("balanceAfter", response.opt("sourceBalance"));
+        } catch (org.json.JSONException exception) {
+            toast("Transfer completed, but receipt details are unavailable.");
+        }
+        return receipt;
+    }
+
+    private void loadTransferReceiptDetails(
+            JSONObject response, JSONObject fallbackReceipt) {
+        String reference = response.optString("referenceNumber", "");
+        if (reference.isEmpty()) {
+            return;
+        }
+        api.execute(() -> api.transactions(0, 50),
+                new ApiClient.Callback<JSONObject>() {
+                    @Override
+                    public void onSuccess(JSONObject history) {
+                        JSONArray records = history.optJSONArray("transactions");
+                        if (records == null) {
+                            return;
+                        }
+                        JSONObject match = null;
+                        for (int i = 0; i < records.length(); i++) {
+                            JSONObject candidate = records.optJSONObject(i);
+                            if (candidate == null || !reference.equals(
+                                    candidate.optString("referenceNumber", ""))) {
+                                continue;
+                            }
+                            match = candidate;
+                            if ("TRANSFER_OUT".equals(candidate.optString("type"))) {
+                                break;
+                            }
+                        }
+                        if (match != null && currentScreen.equals("receipt")
+                                && currentReceipt == fallbackReceipt) {
+                            showReceipt(match, receiptReturnScreen);
+                        }
+                    }
+
+                    @Override
+                    public void onFailure(String message) {
+                        if (isUnauthorized(message)) {
+                            tokenStore.clearToken();
+                            openLogin();
+                        }
+                    }
+                });
     }
 
     private void showMoneyOperation(boolean deposit) {
@@ -915,6 +1470,13 @@ public class MainActivity extends AppCompatActivity {
                     @Override
                     public void onSuccess(JSONObject response) {
                         moneyOperationInProgress = false;
+                        String expectedType = deposit ? "DEPOSIT" : "WITHDRAWAL";
+                        if ("COMPLETED".equals(response.optString("status"))
+                                && expectedType.equals(response.optString("type"))) {
+                            postMoneyNotification(
+                                    response.optString("referenceNumber", ""),
+                                    expectedType, response.optString("amount", ""));
+                        }
                         String operation = deposit ? "Deposit" : "Withdrawal";
                         String balanceAfter = response.optString("balanceAfter", "");
                         String message = operation + " completed for " + accountName + ".";
@@ -1082,6 +1644,11 @@ public class MainActivity extends AppCompatActivity {
                     LinearLayout.LayoutParams.WRAP_CONTENT);
             params.topMargin = dp(8);
             parent.addView(row, params);
+            String returnScreen = "history".equals(currentScreen)
+                    ? "history" : "dashboard";
+            row.setClickable(true);
+            row.setFocusable(true);
+            row.setOnClickListener(view -> showReceipt(transaction, returnScreen));
         }
     }
 
@@ -1118,12 +1685,16 @@ public class MainActivity extends AppCompatActivity {
         TextView navigationButton = screen.findViewById(R.id.screenNavigationButton);
         if (navigationButton != null) {
             navigationButton.setText(home ? "☰" : "‹");
-            navigationButton.setContentDescription(home ? "Open navigation" : "Back to home");
+            navigationButton.setContentDescription(home ? "Open navigation"
+                    : currentScreen.equals("receipt") && "history".equals(receiptReturnScreen)
+                            ? "Back to transaction history" : "Back to home");
             navigationButton.setOnClickListener(view -> {
                 if (moneyOperationInProgress || transferInProgress) {
                     toast("Transaction is processing. Please wait.");
                 } else if (home) {
                     drawerLayout.openDrawer(GravityCompat.START);
+                } else if (currentScreen.equals("receipt")) {
+                    returnFromReceipt();
                 } else {
                     showDashboard();
                 }
