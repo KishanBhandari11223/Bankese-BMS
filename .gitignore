@@ -1,0 +1,20 @@
+# Local secrets and private connection material
+**/.env
+**/.env.*
+!**/.env.example
+*.ovpn
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Generated output and machine-specific IDE settings
+**/build/
+**/target/
+**/.gradle/
+**/local.properties
+**/.idea/
+
+# Local notes and generated directory listings
+**/progress.txt
+**/directory.txt
